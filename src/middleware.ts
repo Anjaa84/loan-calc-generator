@@ -6,7 +6,8 @@ export async function middleware(req: NextRequest) {
   if (await verifySessionToken(req.cookies.get(SESSION_COOKIE)?.value)) return NextResponse.next();
   const url = req.nextUrl.clone();
   url.pathname = "/admin/login";
-  url.search = "";
+  // Come back to the page that was asked for (e.g. /admin/new) after signing in.
+  url.search = req.nextUrl.pathname === "/admin" ? "" : `?next=${encodeURIComponent(req.nextUrl.pathname)}`;
   return NextResponse.redirect(url);
 }
 

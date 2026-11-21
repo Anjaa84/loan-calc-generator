@@ -17,6 +17,11 @@ create table if not exists public.calculators (
 
 alter table public.calculators enable row level security;
 
+-- Newer Supabase projects don't auto-grant API roles on new tables.
+-- Only the server-side service_role gets access; anon/authenticated get nothing.
+grant select, insert, update, delete on public.calculators to service_role;
+revoke all on public.calculators from anon, authenticated;
+
 create or replace function public.touch_updated_at() returns trigger
 language plpgsql as $$
 begin

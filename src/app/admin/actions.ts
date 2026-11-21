@@ -27,7 +27,9 @@ export async function login(_: { error?: string } | undefined, form: FormData): 
     path: "/",
     maxAge: SESSION_TTL_SECONDS,
   });
-  redirect("/admin");
+  // Only allow redirects back into the admin area (no open redirects).
+  const next = String(form.get("next") ?? "");
+  redirect(/^\/admin(\/[\w/-]*)?$/.test(next) ? next : "/admin");
 }
 
 export async function logout() {

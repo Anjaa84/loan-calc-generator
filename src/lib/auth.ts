@@ -7,8 +7,9 @@ export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const enc = new TextEncoder();
 
 function secret(): string {
-  const s = process.env.ADMIN_SESSION_SECRET;
-  if (!s || s.length < 32) throw new Error("ADMIN_SESSION_SECRET must be set (at least 32 characters)");
+  // No length rule. If ADMIN_SESSION_SECRET is empty, fall back to the admin password.
+  const s = process.env.ADMIN_SESSION_SECRET || process.env.ADMIN_PASSWORD;
+  if (!s) throw new Error("Set ADMIN_PASSWORD in your environment variables");
   return s;
 }
 

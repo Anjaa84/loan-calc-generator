@@ -10,32 +10,32 @@ const VARIANTS: Record<Variant, string> = {
   danger: "border border-line bg-surface text-danger hover:bg-danger-soft",
 };
 
+type Size = "sm" | "md";
+const SIZES: Record<Size, string> = {
+  sm: "h-9 min-w-9 px-2.5 text-sm leading-none",
+  md: "h-11 px-4 text-[15px] leading-none",
+};
+const BUTTON_BASE =
+  "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg font-medium whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent";
+
 export function Button({
   variant = "secondary",
   size = "md",
   className,
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: "sm" | "md" }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: Size }) {
   return (
     <button
       type="button"
       {...props}
-      className={cx(
-        "inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50",
-        size === "sm" ? "h-9 min-w-9 px-2.5 text-sm" : "h-11 px-4 text-[15px]",
-        VARIANTS[variant],
-        className,
-      )}
+      className={cx(BUTTON_BASE, "disabled:cursor-not-allowed disabled:opacity-50", SIZES[size], VARIANTS[variant], className)}
     />
   );
 }
 
-export const buttonClass = (variant: Variant = "secondary", extra?: string) =>
-  cx(
-    "inline-flex h-11 items-center justify-center gap-1.5 rounded-lg px-4 text-[15px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent",
-    VARIANTS[variant],
-    extra,
-  );
+/** Button look for links (<Link>) and form submit buttons; same sizes as <Button>. */
+export const buttonClass = (variant: Variant = "secondary", extra?: string, size: Size = "md") =>
+  cx(BUTTON_BASE, SIZES[size], VARIANTS[variant], extra);
 
 const fieldBase =
   "w-full rounded-lg border border-line bg-surface px-3 text-text placeholder:text-muted/70 focus:border-accent focus:outline-2 focus:outline-accent/30 disabled:opacity-60";

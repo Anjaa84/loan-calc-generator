@@ -211,7 +211,7 @@ function Picker({
             ]}
             onChange={(v) => setPct(v === "p")}
           />
-          <Button size="sm" variant="primary" className="h-10" disabled={!validNum} onClick={() => onPick({ kind: "num", v: n, pct })}>
+          <Button variant="primary" disabled={!validNum} onClick={() => onPick({ kind: "num", v: n, pct })}>
             Use {validNum ? `${text.trim()}${pct ? "%" : ""}` : "number"}
           </Button>
         </div>

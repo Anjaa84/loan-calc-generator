@@ -18,14 +18,14 @@ export function RowActions({ id, slug, title }: { id: string; slug: string; titl
     }
   };
   return (
-    <div className="flex flex-wrap gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <Button size="sm" onClick={copy}>
         {copied ? "Copied ✓" : "Copy link"}
       </Button>
-      <Link href={`/c/${slug}`} target="_blank" className={buttonClass("secondary", "h-9 px-2.5 text-sm")}>
+      <Link href={`/c/${slug}`} target="_blank" className={buttonClass("secondary", undefined, "sm")}>
         Open
       </Link>
-      <Link href={`/admin/${id}/edit`} className={buttonClass("secondary", "h-9 px-2.5 text-sm")}>
+      <Link href={`/admin/${id}/edit`} className={buttonClass("secondary", undefined, "sm")}>
         Edit
       </Link>
       <Button

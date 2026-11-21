@@ -196,15 +196,20 @@ export function Canvas(p: CanvasProps) {
       </ZoneArea>
 
       <ZoneArea zone="results" title="Customer sees" empty="Drag a Result here" onEmptyTap={() => p.onAddTap("result")} items={z.results}>
-        {big.map((f) => (
-          <Block key={f.id} field={f} {...p} badge={f.hidden ? "Hidden from customers" : undefined} actions>
-            <BigResult
-              compact
-              label={<InlineText value={f.label} onChange={(v) => p.onRename(f.id, v)} ariaLabel={`Name of ${f.label}`} className="text-sm" onFocusSelect={() => p.onSelect(f.id)} />}
-              value={valueText(f, p)}
-            />
-          </Block>
-        ))}
+        {big.length > 0 && (
+          // Same border + padding as the cards around it so handles and edges line up.
+          <div className="flex flex-col gap-1 border border-transparent p-2">
+            {big.map((f) => (
+              <Block key={f.id} field={f} {...p} badge={f.hidden ? "Hidden from customers" : undefined} actions>
+                <BigResult
+                  compact
+                  label={<InlineText value={f.label} onChange={(v) => p.onRename(f.id, v)} ariaLabel={`Name of ${f.label}`} className="text-sm" onFocusSelect={() => p.onSelect(f.id)} />}
+                  value={valueText(f, p)}
+                />
+              </Block>
+            ))}
+          </div>
+        )}
         {rows.length > 0 && (
           <div className="flex flex-col rounded-2xl border border-line bg-surface p-2">
             {rows.map((f) => (

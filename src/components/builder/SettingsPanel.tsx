@@ -228,7 +228,7 @@ export function SettingsPanel(p: Props) {
                 .map((t) => {
                   const I = BLOCK_INFO[t].Icon;
                   return (
-                    <Button key={t} size="sm" className="h-11 justify-start" onClick={() => p.onConvert(t)}>
+                    <Button key={t} className="justify-start" onClick={() => p.onConvert(t)}>
                       <I size={16} /> {BLOCK_INFO[t].name}
                     </Button>
                   );

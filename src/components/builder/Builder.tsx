@@ -2,24 +2,36 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import { saveCalculator, suggestSlug } from "@/app/admin/actions";
-import { defaultInputs, evaluateSchema } from "@/lib/engine/evaluate";
-import { exprToTokens, parseTokens } from "@/lib/engine/parse";
+import { evaluateSchema } from "@/lib/engine/evaluate";
+import { formatValue } from "@/lib/engine/format";
+import { exprRefs, exprToTokens, parseTokens } from "@/lib/engine/parse";
+import { emptySteps, exprToSteps, stepsToExpr, type Steps } from "@/lib/engine/steps";
 import type { Token } from "@/lib/engine/tokens";
 import type { ReuploadDiff } from "@/lib/excel/mergeReupload";
 import { toUrlSlug, uniqueId } from "@/lib/excel/labels";
-import type { CalcSchema, CalculatorDraft, Field, FieldKind } from "@/lib/schema/types";
+import { commit, initHistory, redo, undo, type History } from "@/lib/history";
+import type { CalcSchema, CalculatorDraft, Field, SelectOption } from "@/lib/schema/types";
 import { validateSchema } from "@/lib/schema/validate";
-import { Calculator } from "../calculator/Calculator";
-import { Button, Card, cx, Field as FormField, TextArea, TextInput, Toggle } from "../ui";
-import { FieldCard } from "./FieldCard";
+import { insertIntoZone, reorderZone, type Zone } from "@/lib/schema/zones";
+import { Calculator, initialRaw } from "../calculator/Calculator";
+import { valuesFromRaw } from "../calculator/parts";
+import { IconPencil, IconPlay, IconPlus, IconRedo, IconShare, IconUndo, IconWarn } from "../icons";
+import { Button, cx, Toast } from "../ui";
+import { BuilderDnd, Canvas } from "./Canvas";
 import { tryParse } from "./FormulaBuilder";
+import { AddSheet, Palette } from "./Palette";
+import { SettingsPanel, type BlockType } from "./SettingsPanel";
+import { ShareSheet, type Meta } from "./ShareSheet";
 
 type Props = {
   initial: CalculatorDraft;
   importNotes?: string[];
 };
+
+type Doc = { meta: Meta; schema: CalcSchema };
+type Issue = { id?: string; text: string };
 
 const tokensOf = (schema: CalcSchema) =>
   Object.fromEntries(schema.fields.filter((f) => f.formula).map((f) => [f.id, exprToTokens(f.formula!)])) as Record<string, Token[]>;
@@ -30,138 +42,232 @@ export async function importExcelFile(file: File) {
   return importWorkbook(await file.arrayBuffer());
 }
 
+const TIP_KEY = "lcg.builderTipDismissed";
+
+// Field-level problems that the builder shows on the block itself.
+const FIELD_LEVEL = /needs a formula|no longer exists|needs at least one option|limited by itself|needs a value|needs a label/;
+
+function newField(type: BlockType, used: Set<string>): Field {
+  const label = { number: "New number box", dropdown: "New dropdown", result: "New result", fixed: "New fixed number" }[type];
+  const id = uniqueId(label, used);
+  switch (type) {
+    case "number":
+      return { id, label, kind: "input", inputType: "number", format: "currency", decimals: 2, defaultValue: null };
+    case "dropdown":
+      return {
+        id,
+        label,
+        kind: "input",
+        inputType: "select",
+        format: "integer",
+        decimals: 0,
+        options: [
+          { label: "3 months", value: 3 },
+          { label: "6 months", value: 6 },
+          { label: "12 months", value: 12 },
+        ],
+        defaultValue: 3,
+      };
+    case "result":
+      return { id, label, kind: "output", format: "currency", decimals: 2 };
+    case "fixed":
+      return { id, label, kind: "constant", value: 0, format: "number", decimals: 2, hidden: true };
+  }
+}
+
+function choicesFor(f: Field): SelectOption[] {
+  if (f.format === "percent")
+    return [0.1, 0.15, 0.2].map((value) => ({ value, label: `${Math.round(value * 100)}%` }));
+  const v = f.kind === "constant" ? f.value : f.defaultValue;
+  if (v != null) return [{ value: v, label: String(v) }];
+  return [
+    { label: "3 months", value: 3 },
+    { label: "6 months", value: 6 },
+    { label: "12 months", value: 12 },
+  ];
+}
+
 export function Builder({ initial, importNotes }: Props) {
   const router = useRouter();
   const isNew = !initial.id;
-  const [meta, setMeta] = useState({
-    title: initial.title,
-    slug: initial.slug,
-    description: initial.description,
-    currency: initial.currency,
-    published: initial.published,
-    source_filename: initial.source_filename,
-  });
+  const [initialDoc] = useState<Doc>(() => ({
+    meta: {
+      title: initial.title,
+      slug: initial.slug,
+      description: initial.description,
+      currency: initial.currency,
+      published: initial.published,
+      source_filename: initial.source_filename,
+    },
+    schema: initial.schema,
+  }));
+  const [hist, setHist] = useState<History<Doc>>(() => initHistory(initialDoc));
+  const [savedDoc, setSavedDoc] = useState<Doc | null>(isNew ? null : initialDoc);
+  const { meta, schema } = hist.present;
+  const dirty = hist.present !== savedDoc;
+
   const [slugTouched, setSlugTouched] = useState(!isNew);
-  const [schema, setSchema] = useState<CalcSchema>(initial.schema);
   const [drafts, setDrafts] = useState<Record<string, Token[]>>(() => tokensOf(initial.schema));
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"build" | "preview">("build");
+  const [stepDrafts, setStepDrafts] = useState<Record<string, Steps>>({});
+  const [advanced, setAdvanced] = useState<Record<string, boolean>>({});
+  const [sampleRaw, setSampleRaw] = useState<Record<string, string>>(() => initialRaw(initial.schema));
+
+  const [mode, setMode] = useState<"edit" | "try">("edit");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [notes, setNotes] = useState<string[] | undefined>(importNotes);
   const [pending, setPending] = useState<{ schema: CalcSchema; diff: ReuploadDiff; notes: string[]; file: string } | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [saveErrors, setSaveErrors] = useState<string[]>([]);
   const [savedAt, setSavedAt] = useState<number | null>(null);
-  const [dirty, setDirty] = useState(isNew);
   const [saving, startSave] = useTransition();
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const [toast, setToast] = useState<{ message: string; undo?: boolean } | null>(null);
+  const [showTip, setShowTip] = useState(false);
 
-  const labelOf = useMemo(() => {
-    const m = new Map(schema.fields.map((f) => [f.id, f.label]));
-    return (id: string) => m.get(id) ?? "⚠ missing field";
-  }, [schema]);
+  // ------------------------------------------------------------ edits
 
-  const formulaErrors = useMemo(() => {
-    const out: Record<string, string> = {};
-    for (const f of schema.fields) {
-      if (f.kind !== "output") continue;
-      const t = drafts[f.id] ?? [];
-      const r = tryParse(t);
-      if (!r.ok) out[f.id] = t.length ? `Formula: ${r.message}` : "Formula is empty";
-    }
-    return out;
-  }, [schema, drafts]);
+  const apply = useCallback((fn: (d: Doc) => Doc, key?: string) => setHist((h) => commit(h, fn(h.present), key)), []);
+  const updateSchema = useCallback((fn: (s: CalcSchema) => CalcSchema, key?: string) => apply((d) => ({ ...d, schema: fn(d.schema) }), key), [apply]);
+  const setField = useCallback(
+    (next: Field, key?: string) => updateSchema((s) => ({ ...s, fields: s.fields.map((f) => (f.id === next.id ? next : f)) }), key),
+    [updateSchema],
+  );
+  const setMeta = (patch: Partial<Meta>, key?: string) => apply((d) => ({ ...d, meta: { ...d.meta, ...patch } }), key);
 
-  const problems = useMemo(() => {
-    const p = validateSchema(schema).filter((x) => !/needs a formula/.test(x));
-    for (const [id, msg] of Object.entries(formulaErrors)) p.unshift(`"${labelOf(id)}": ${msg}`);
-    return p;
-  }, [schema, formulaErrors, labelOf]);
-
-  const preview = useMemo(() => evaluateSchema(schema, defaultInputs(schema)).values, [schema]);
-
-  const update = (fn: (s: CalcSchema) => CalcSchema) => {
-    setSchema((s) => fn(s));
-    setDirty(true);
+  const resync = (s: CalcSchema) => {
+    setDrafts(tokensOf(s));
+    setStepDrafts({});
   };
-  const setField = (id: string, next: Field) => update((s) => ({ ...s, fields: s.fields.map((f) => (f.id === id ? next : f)) }));
+  const doUndo = () => {
+    const h = undo(hist);
+    if (h === hist) return;
+    setHist(h);
+    resync(h.present.schema);
+  };
+  const doRedo = () => {
+    const h = redo(hist);
+    if (h === hist) return;
+    setHist(h);
+    resync(h.present.schema);
+  };
 
-  const setTokens = (id: string, tokens: Token[]) => {
+  const byId = useMemo(() => new Map(schema.fields.map((f) => [f.id, f])), [schema]);
+  const labelOf = useCallback((id: string) => byId.get(id)?.label ?? "⚠ removed box", [byId]);
+
+  const result = useMemo(
+    () => evaluateSchema(schema, valuesFromRaw(schema, sampleRaw), (v, f) => formatValue(v, f, meta.currency)),
+    [schema, sampleRaw, meta.currency],
+  );
+  const sampleOf = useCallback((id: string) => {
+    const f = byId.get(id);
+    return f ? formatValue(result.values[id], f, meta.currency) : "";
+  }, [byId, result, meta.currency]);
+
+  const stepsFor = (f: Field): Steps | null =>
+    stepDrafts[f.id] ?? (f.formula ? exprToSteps(f.formula) : drafts[f.id]?.length ? null : emptySteps());
+
+  const onSteps = (id: string, s: Steps) => {
+    setStepDrafts((d) => ({ ...d, [id]: s }));
+    const formula = stepsToExpr(s);
+    setDrafts((d) => ({ ...d, [id]: formula ? exprToTokens(formula) : [] }));
+    updateSchema((sc) => ({ ...sc, fields: sc.fields.map((f) => (f.id === id ? { ...f, formula, verified: undefined } : f)) }));
+  };
+  const onTokens = (id: string, tokens: Token[]) => {
     setDrafts((d) => ({ ...d, [id]: tokens }));
+    setStepDrafts(({ [id]: _drop, ...rest }) => (void _drop, rest));
     let formula: Field["formula"];
     try {
       formula = tokens.length ? parseTokens(tokens) : undefined;
     } catch {
       formula = undefined;
     }
-    update((s) => ({ ...s, fields: s.fields.map((f) => (f.id === id ? { ...f, formula, verified: undefined } : f)) }));
+    updateSchema((sc) => ({ ...sc, fields: sc.fields.map((f) => (f.id === id ? { ...f, formula, verified: undefined } : f)) }));
   };
 
-  const changeKind = (f: Field, kind: FieldKind) => {
-    const base: Field = { id: f.id, label: f.label, kind, format: f.format, decimals: f.decimals, helpText: f.helpText, hidden: f.hidden, source: f.source };
-    const next: Field =
-      kind === "input"
-        ? { ...base, inputType: "number", defaultValue: f.kind === "constant" ? (f.value ?? null) : null, hidden: undefined }
-        : kind === "constant"
-          ? { ...base, value: f.kind === "input" ? (f.defaultValue ?? 0) : (preview[f.id] ?? 0) }
-          : { ...base, hidden: undefined };
-    setField(f.id, next);
+  const addBlock = (type: BlockType, index?: number) => {
+    const f = newField(type, new Set(schema.fields.map((x) => x.id)));
+    updateSchema((s) => ({ ...s, fields: insertIntoZone(s.fields, f, index) }));
+    setSelectedId(f.id);
+    setMode("edit");
   };
 
-  const addField = (kind: FieldKind | "select") => {
-    const used = new Set(schema.fields.map((f) => f.id));
-    const label = { input: "New input", select: "New dropdown", output: "New result", constant: "New fixed value" }[kind];
-    const id = uniqueId(label, used);
-    const f: Field =
-      kind === "select"
-        ? {
-            id,
-            label,
-            kind: "input",
-            inputType: "select",
-            format: "integer",
-            decimals: 0,
-            options: [
-              { label: "3 months", value: 3 },
-              { label: "6 months", value: 6 },
-              { label: "12 months", value: 12 },
-            ],
-            defaultValue: 3,
-          }
-        : kind === "input"
-          ? { id, label, kind, inputType: "number", format: "currency", decimals: 2, defaultValue: null }
-          : kind === "constant"
-            ? { id, label, kind, value: 0, format: "number", decimals: 2, hidden: true }
-            : { id, label, kind, format: "currency", decimals: 2 };
-    update((s) => ({ ...s, fields: [...s.fields, f] }));
-    setOpenId(id);
+  const convert = (f: Field, to: BlockType) => {
+    const base = { id: f.id, label: f.label, format: f.format, decimals: f.decimals, helpText: f.helpText, source: f.source };
+    let next: Field;
+    if (to === "number")
+      next = {
+        ...base,
+        kind: "input",
+        inputType: "number",
+        defaultValue: f.kind === "constant" ? (f.value ?? null) : f.kind === "input" ? (f.defaultValue ?? null) : null,
+        min: f.min,
+        max: f.max,
+      };
+    else if (to === "dropdown") {
+      const options = f.options?.length ? f.options : choicesFor(f);
+      next = { ...base, kind: "input", inputType: "select", options, defaultValue: options[0].value };
+    } else if (to === "result") next = { ...base, kind: "output", formula: f.kind === "output" ? f.formula : undefined, highlight: f.highlight };
+    else
+      next = {
+        ...base,
+        kind: "constant",
+        value: (f.kind === "input" ? f.defaultValue : f.kind === "output" ? result.values[f.id] : f.value) ?? 0,
+        hidden: true,
+      };
+    setField(next);
+    setDrafts((d) => ({ ...d, [f.id]: next.formula ? exprToTokens(next.formula) : [] }));
+    setStepDrafts(({ [f.id]: _drop, ...rest }) => (void _drop, rest));
   };
 
-  const removeField = (f: Field) => {
-    const users = schema.fields.filter(
-      (x) => x.id !== f.id && ((drafts[x.id] ?? []).some((t) => t.k === "ref" && t.field === f.id) || x.min?.field === f.id || x.max?.field === f.id),
-    );
-    const msg = users.length
-      ? `"${f.label}" is used by: ${users.map((u) => u.label).join(", ")}. Delete it anyway? Those formulas will need fixing.`
-      : `Delete "${f.label}"?`;
-    if (!confirm(msg)) return;
-    update((s) => ({ ...s, fields: s.fields.filter((x) => x.id !== f.id) }));
-    setDrafts((d) => {
-      const { [f.id]: _removed, ...rest } = d;
-      void _removed;
-      return rest;
-    });
+  const remove = (f: Field) => {
+    updateSchema((s) => ({ ...s, fields: s.fields.filter((x) => x.id !== f.id) }));
+    setSelectedId(null);
+    setToast({ message: `Removed "${f.label}"`, undo: true });
   };
 
-  const move = (i: number, dir: -1 | 1) =>
-    update((s) => {
-      const fields = [...s.fields];
-      const j = i + dir;
-      if (j < 0 || j >= fields.length) return s;
-      [fields[i], fields[j]] = [fields[j], fields[i]];
-      return { ...s, fields };
-    });
+  // ------------------------------------------------------------ problems
 
-  const onReupload = async (file: File) => {
+  const fieldProblems = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const f of schema.fields) {
+      let p: string | undefined;
+      if (!f.label.trim()) p = "Give this a name";
+      else if (f.kind === "output") {
+        if (!f.formula) {
+          const t = drafts[f.id] ?? [];
+          const sd = stepDrafts[f.id];
+          const parsed = tryParse(t);
+          p = sd?.first ? "Finish the calculation: a step is empty" : t.length && !parsed.ok ? `Calculation: ${parsed.message}` : "Needs a calculation";
+        } else if ([...exprRefs(f.formula)].some((r) => !byId.has(r))) p = "Uses a box that was removed";
+      } else if (f.kind === "input") {
+        if (f.inputType === "select" && !f.options?.length) p = "Add at least one choice";
+        for (const b of [f.min, f.max]) {
+          if (b?.field === f.id) p = "Its limit can't be itself";
+          else if (b?.field !== undefined && !byId.has(b.field)) p = "Its limit uses a box that was removed";
+        }
+      } else if (f.value === undefined) p = "Needs a value";
+      if (p) out[f.id] = p;
+    }
+    return out;
+  }, [schema, drafts, stepDrafts, byId]);
+
+  const issues: Issue[] = useMemo(() => {
+    const list: Issue[] = schema.fields.filter((f) => fieldProblems[f.id]).map((f) => ({ id: f.id, text: `${f.label || "Untitled"}: ${fieldProblems[f.id]}` }));
+    for (const g of validateSchema(schema)) if (!FIELD_LEVEL.test(g)) list.push({ text: g });
+    if (!meta.title.trim()) list.push({ text: "Give the calculator a name (at the top)" });
+    return list;
+  }, [schema, fieldProblems, meta.title]);
+
+  const jumpToIssue = () => {
+    const first = issues.find((i) => i.id);
+    setMode("edit");
+    if (first?.id) setSelectedId(first.id);
+  };
+
+  // ------------------------------------------------------------ excel + save
+
+  const onExcel = async (file: File) => {
     setUploadError(null);
     try {
       const { mergeReupload } = await import("@/lib/excel/mergeReupload");
@@ -172,286 +278,353 @@ export function Builder({ initial, importNotes }: Props) {
       setUploadError(`Couldn't read that file: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
-
   const applyPending = () => {
     if (!pending) return;
-    update(() => pending.schema);
-    setDrafts(tokensOf(pending.schema));
+    apply((d) => ({ schema: pending.schema, meta: { ...d.meta, source_filename: pending.file } }));
+    resync(pending.schema);
     setNotes(pending.notes);
-    setMeta((m) => ({ ...m, source_filename: pending.file }));
     setPending(null);
+    setShareOpen(false);
+    setSelectedId(null);
   };
 
-  const save = () =>
+  const save = () => {
+    if (issues.length) {
+      jumpToIssue();
+      setToast({ message: "Fix the item marked in red first, then save." });
+      return;
+    }
+    const doc = hist.present;
     startSave(async () => {
       setSaveErrors([]);
-      let slug = meta.slug || toUrlSlug(meta.title);
+      let slug = doc.meta.slug || toUrlSlug(doc.meta.title);
       if (!slugTouched) slug = await suggestSlug(slug, initial.id);
-      const res = await saveCalculator({ ...meta, slug, id: initial.id, schema });
+      const res = await saveCalculator({ ...doc.meta, slug, id: initial.id, schema: doc.schema });
       if (!res.ok) {
         setSaveErrors(res.errors);
         return;
       }
-      setDirty(false);
+      if (res.slug === doc.meta.slug) setSavedDoc(doc);
+      else {
+        const next = { ...doc, meta: { ...doc.meta, slug: res.slug } };
+        setHist((h) => (h.present === doc ? { ...h, present: next } : h));
+        setSavedDoc(next);
+      }
       setSavedAt(Date.now());
-      setMeta((m) => ({ ...m, slug: res.slug }));
       if (isNew) router.replace(`/admin/${res.id}/edit?created=1`);
       else router.refresh();
     });
+  };
 
-  const canSave = problems.length === 0 && meta.title.trim() !== "" && !saving;
-  const publicPath = `/c/${meta.slug || toUrlSlug(meta.title)}`;
+  // ------------------------------------------------------------ effects
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.closest("input, textarea, select, [contenteditable=true]") || t.isContentEditable)) return;
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) {
+        e.preventDefault();
+        doUndo();
+      } else if ((k === "z" && e.shiftKey) || k === "y") {
+        e.preventDefault();
+        doRedo();
+      } else if (k === "s") {
+        e.preventDefault();
+        save();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 6000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  useEffect(() => {
+    try {
+      setShowTip(localStorage.getItem(TIP_KEY) !== "1");
+    } catch {
+      setShowTip(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    document.querySelector(`[data-field="${selectedId}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedId]);
+
+  const selected = selectedId ? byId.get(selectedId) : undefined;
+
+  // ------------------------------------------------------------ render
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-4 pt-4 pb-28 lg:pb-10">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <Link href="/admin" className="text-sm text-muted hover:text-text">
-            ← All calculators
+    <div className="min-h-dvh">
+      <header className="sticky top-0 z-20 border-b border-line bg-bg/90 backdrop-blur">
+        <div className="mx-auto flex h-14 max-w-7xl items-center gap-1 px-3 sm:gap-2 sm:px-4">
+          <Link href="/admin" className="flex h-10 items-center rounded-lg px-2 text-sm text-muted hover:bg-surface-2 hover:text-text">
+            ←<span className="ml-1 hidden sm:inline">Calculators</span>
           </Link>
+
+          <div className="mx-auto flex rounded-xl bg-surface-2 p-1" role="tablist" aria-label="Mode">
+            {(
+              [
+                ["edit", "Edit", IconPencil],
+                ["try", "Try it", IconPlay],
+              ] as const
+            ).map(([m, label, I]) => (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={mode === m}
+                onClick={() => setMode(m)}
+                className={cx(
+                  "flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium whitespace-nowrap transition-colors sm:px-4",
+                  mode === m ? "bg-surface text-text shadow-sm" : "text-muted hover:text-text",
+                )}
+              >
+                <I size={14} /> {label}
+              </button>
+            ))}
+          </div>
+
+          <Button size="sm" variant="ghost" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!hist.past.length} onClick={doUndo}>
+            <IconUndo />
+          </Button>
+          <Button size="sm" variant="ghost" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" disabled={!hist.future.length} onClick={doRedo} className="hidden sm:inline-flex">
+            <IconRedo />
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setShareOpen(true)} aria-label="Share and settings">
+            <IconShare /> <span className="hidden md:inline">Share</span>
+          </Button>
+          <span className="hidden w-24 text-right text-xs text-muted lg:inline" aria-live="polite">
+            {saving ? "Saving…" : dirty ? "Unsaved changes" : savedAt ? "Saved ✓" : "All saved"}
+          </span>
+          <Button size="sm" variant="primary" onClick={save} disabled={saving} className="min-w-16 sm:min-w-20">
+            {saving ? "Saving…" : isNew ? "Create" : "Save"}
+          </Button>
         </div>
-        {!isNew && (
-          <Link href={publicPath} target="_blank" className="text-sm text-accent hover:underline">
-            Open public page ↗
-          </Link>
-        )}
-      </div>
-
-      <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-surface-2 p-1 lg:hidden" role="tablist">
-        {(["build", "preview"] as const).map((t) => (
-          <button
-            key={t}
-            role="tab"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-            className={cx("h-10 rounded-lg text-sm font-medium", tab === t ? "bg-surface shadow-sm" : "text-muted")}
-          >
-            {t === "build" ? "Edit" : "Preview"}
-          </button>
-        ))}
-      </div>
-
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
-        <div className={cx("flex flex-col gap-4", tab !== "build" && "hidden lg:flex")}>
-          <Card className="flex flex-col gap-4 p-4 sm:p-5">
-            <FormField label="Calculator name" htmlFor="title">
-              <TextInput
-                id="title"
-                value={meta.title}
-                placeholder="e.g. HP Loan Calculator"
-                onChange={(e) => {
-                  const title = e.target.value;
-                  setMeta((m) => ({ ...m, title, slug: slugTouched ? m.slug : toUrlSlug(title) }));
-                  setDirty(true);
-                }}
-              />
-            </FormField>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <FormField label="Public link" htmlFor="slug" hint={`Customers open ${publicPath}`}>
-                <div className="flex items-center rounded-lg border border-line bg-surface focus-within:border-accent">
-                  <span className="pl-3 text-sm text-muted">/c/</span>
-                  <input
-                    id="slug"
-                    value={meta.slug}
-                    onChange={(e) => {
-                      setSlugTouched(true);
-                      setMeta((m) => ({ ...m, slug: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") }));
-                      setDirty(true);
-                    }}
-                    className="h-11 w-full min-w-0 bg-transparent px-1 outline-none"
-                  />
-                </div>
-              </FormField>
-              <FormField label="Currency label" htmlFor="currency" hint="Shown before money values, e.g. Rs. or $">
-                <TextInput
-                  id="currency"
-                  value={meta.currency}
-                  maxLength={10}
-                  placeholder="Rs."
-                  onChange={(e) => {
-                    setMeta((m) => ({ ...m, currency: e.target.value }));
-                    setDirty(true);
-                  }}
-                />
-              </FormField>
-            </div>
-            <FormField label="Description (optional)" htmlFor="desc">
-              <TextArea
-                id="desc"
-                value={meta.description}
-                onChange={(e) => {
-                  setMeta((m) => ({ ...m, description: e.target.value }));
-                  setDirty(true);
-                }}
-              />
-            </FormField>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <Toggle
-                checked={meta.published}
-                onChange={(v) => {
-                  setMeta((m) => ({ ...m, published: v }));
-                  setDirty(true);
-                }}
-                label={meta.published ? "Published: anyone with the link can use it" : "Draft: only you can see it"}
-              />
-              <div className="flex items-center gap-2">
-                <input
-                  ref={fileRef}
-                  type="file"
-                  accept=".xlsx,.xlsm,.xls"
-                  className="hidden"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (file) void onReupload(file);
-                  }}
-                />
-                <Button size="sm" onClick={() => fileRef.current?.click()}>
-                  {meta.source_filename ? "Re-upload Excel" : "Import from Excel"}
-                </Button>
-              </div>
-            </div>
-            {meta.source_filename && <p className="-mt-2 text-xs text-muted">Last imported from {meta.source_filename}</p>}
-            {uploadError && <p className="text-sm text-danger">{uploadError}</p>}
-          </Card>
-
-          {pending && (
-            <Card className="flex flex-col gap-3 border-accent p-4 sm:p-5">
-              <h2 className="font-semibold">Update from {pending.file}?</h2>
-              <DiffList diff={pending.diff} />
-              <p className="text-sm text-muted">Your labels, help text, visibility and dropdown settings are kept. Nothing is saved until you press Save.</p>
-              <div className="flex gap-2">
-                <Button variant="primary" onClick={applyPending}>
-                  Apply changes
-                </Button>
-                <Button onClick={() => setPending(null)}>Cancel</Button>
-              </div>
-            </Card>
-          )}
-
-          {notes && notes.length > 0 && (
-            <div className="rounded-xl bg-accent-soft px-4 py-3 text-sm text-text">
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="font-medium">Imported from Excel. Review the fields below.</span>
-                <button type="button" onClick={() => setNotes(undefined)} className="text-muted hover:text-text" aria-label="Dismiss">
-                  ✕
+        {(issues.length > 0 || saveErrors.length > 0) && mode === "edit" && (
+          <div className="border-t border-line bg-danger-soft/60">
+            <div className="mx-auto flex max-w-7xl items-center gap-2 px-4 py-1.5 text-sm text-danger">
+              <IconWarn size={16} />
+              <span className="min-w-0 flex-1 truncate">
+                {saveErrors.length
+                  ? `Couldn't save: ${saveErrors.join(" · ")}`
+                  : issues.length === 1
+                    ? issues[0].text
+                    : `${issues.length} things to fix before saving · ${issues[0].text}`}
+              </span>
+              {issues.some((i) => i.id) && (
+                <button type="button" onClick={jumpToIssue} className="shrink-0 font-medium underline underline-offset-2">
+                  Show me
                 </button>
-              </div>
-              <ul className="list-disc pl-5 text-muted">
-                {notes.map((n, i) => (
-                  <li key={i}>{n}</li>
-                ))}
-              </ul>
+              )}
             </div>
-          )}
-
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Fields</h2>
-            <span className="text-sm text-muted">Tap a field to edit it</span>
           </div>
+        )}
+      </header>
 
-          {schema.fields.length === 0 ? (
-            <p className="rounded-2xl border border-dashed border-line bg-surface p-6 text-center text-sm text-muted">
-              No fields yet. Add an input (like a price), then a result with a formula.
-            </p>
-          ) : (
-            <ul className="flex flex-col gap-2">
-              {schema.fields.map((f, i) => (
-                <FieldCard
-                  key={f.id}
-                  field={f}
-                  index={i}
-                  count={schema.fields.length}
-                  open={openId === f.id}
-                  onToggle={() => setOpenId((o) => (o === f.id ? null : f.id))}
-                  onChange={(next) => setField(f.id, next)}
-                  onKindChange={(k) => changeKind(f, k)}
-                  onMove={(d) => move(i, d)}
-                  onDelete={() => removeField(f)}
-                  allFields={schema.fields}
-                  labelOf={labelOf}
-                  tokens={drafts[f.id] ?? []}
-                  onTokens={(t) => setTokens(f.id, t)}
-                  formulaError={formulaErrors[f.id]}
-                  previewValue={preview[f.id] ?? null}
-                  currency={meta.currency}
-                />
-              ))}
-            </ul>
-          )}
-
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <Button onClick={() => addField("input")}>+ Input</Button>
-            <Button onClick={() => addField("select")}>+ Dropdown</Button>
-            <Button onClick={() => addField("output")}>+ Result</Button>
-            <Button onClick={() => addField("constant")}>+ Fixed value</Button>
-          </div>
-        </div>
-
-        <aside className={cx("flex flex-col gap-3 lg:sticky lg:top-4 lg:self-start", tab !== "preview" && "hidden lg:flex")}>
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Live preview</h2>
-            <span className="text-xs text-muted">What customers see</span>
-          </div>
-          <div className="rounded-3xl border border-line bg-bg p-3 sm:p-4">
+      {mode === "try" ? (
+        <main className="mx-auto flex w-full max-w-md flex-col gap-3 px-4 py-6">
+          <p className="text-center text-sm text-muted">This is exactly what customers see. Type numbers to test it.</p>
+          <div className="rounded-[2rem] border border-line bg-bg p-3 shadow-sm sm:p-4">
             <div className="mb-3 px-1">
               <div className="text-lg font-semibold">{meta.title || "Untitled calculator"}</div>
               {meta.description && <p className="text-sm whitespace-pre-line text-muted">{meta.description}</p>}
             </div>
-            <Calculator key={JSON.stringify(defaultInputs(schema))} schema={schema} currency={meta.currency} compact />
+            <Calculator schema={schema} currency={meta.currency} compact raw={sampleRaw} onRawChange={setSampleRaw} />
           </div>
-        </aside>
-      </div>
+          <Button className="self-center" onClick={() => setMode("edit")}>
+            <IconPencil size={16} /> Back to editing
+          </Button>
+        </main>
+      ) : (
+        <BuilderDnd
+          schema={schema}
+          onReorder={(zone: Zone, from, to) => updateSchema((s) => ({ ...s, fields: reorderZone(s.fields, zone, from, to) }))}
+          onInsert={addBlock}
+        >
+          <div className="mx-auto grid w-full max-w-7xl gap-6 px-4 pt-4 pb-32 lg:grid-cols-[220px_minmax(0,1fr)_380px] lg:pb-10">
+            <aside className="hidden lg:block">
+              <div className="sticky top-20">
+                <Palette onAdd={(t) => addBlock(t)} />
+              </div>
+            </aside>
 
-      {/* Save bar */}
-      <div className="fixed inset-x-0 bottom-0 z-10 border-t border-line bg-surface/95 backdrop-blur lg:static lg:mt-6 lg:border-0 lg:bg-transparent">
-        <div className="mx-auto flex max-w-6xl flex-col gap-2 px-4 py-3 lg:px-0">
-          {(saveErrors.length > 0 || problems.length > 0) && (
-            <details className="text-sm text-danger" open={saveErrors.length > 0}>
-              <summary className="cursor-pointer">
-                {saveErrors.length > 0 ? "Couldn't save" : `${problems.length} thing(s) to fix before saving`}
-              </summary>
-              <ul className="mt-1 max-h-32 list-disc overflow-auto pl-5">
-                {(saveErrors.length ? saveErrors : problems).map((p, i) => (
-                  <li key={i}>{p}</li>
-                ))}
-              </ul>
-            </details>
-          )}
-          <div className="flex items-center justify-end gap-3">
-            <span className="text-sm text-muted" aria-live="polite">
-              {saving ? "Saving…" : dirty ? "Unsaved changes" : savedAt ? "Saved ✓" : ""}
-            </span>
-            <Button variant="primary" disabled={!canSave} onClick={save} className="min-w-28">
-              {isNew ? "Create calculator" : "Save"}
-            </Button>
+            <main className="mx-auto flex w-full max-w-xl min-w-0 flex-col gap-4">
+              {showTip && (
+                <div className="flex items-start gap-3 rounded-xl bg-accent-soft px-4 py-3 text-sm">
+                  <span className="min-w-0 flex-1">
+                    <b className="font-semibold">This is your calculator.</b> Drag the ⠿ handle to move things · Tap anything to change it · Press{" "}
+                    <b className="font-semibold">Try it</b> to test.
+                  </span>
+                  <button
+                    type="button"
+                    aria-label="Dismiss tip"
+                    className="text-muted hover:text-text"
+                    onClick={() => {
+                      setShowTip(false);
+                      try {
+                        localStorage.setItem(TIP_KEY, "1");
+                      } catch {
+                        /* storage unavailable: the tip just shows again next time */
+                      }
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {notes && notes.length > 0 && (
+                <div className="rounded-xl bg-warn-soft px-4 py-3 text-sm">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="font-medium">Imported from Excel. Please check these:</span>
+                    <button type="button" onClick={() => setNotes(undefined)} className="text-muted hover:text-text" aria-label="Dismiss">
+                      ✕
+                    </button>
+                  </div>
+                  <ul className="list-disc pl-5 text-muted">
+                    {notes.map((n, i) => (
+                      <li key={i}>{n}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <Canvas
+                schema={schema}
+                currency={meta.currency}
+                title={meta.title}
+                description={meta.description}
+                onTitle={(title) => setMeta({ title, ...(slugTouched ? {} : { slug: toUrlSlug(title) }) })}
+                onDescription={(description) => setMeta({ description })}
+                sampleRaw={sampleRaw}
+                result={result}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                problems={fieldProblems}
+                onRename={(id, label) => {
+                  const f = byId.get(id);
+                  if (f) setField({ ...f, label });
+                }}
+                onToggleHidden={(id) => {
+                  const f = byId.get(id);
+                  if (f) setField({ ...f, hidden: !f.hidden || undefined });
+                }}
+                onToggleHighlight={(id) => {
+                  const f = byId.get(id);
+                  if (f) setField({ ...f, highlight: !f.highlight || undefined });
+                }}
+                onAddTap={(t) => addBlock(t)}
+              />
+            </main>
+
+            {selected ? (
+              <>
+                <button type="button" aria-label="Close settings" className="fixed inset-0 z-30 bg-black/40 lg:hidden" onClick={() => setSelectedId(null)} />
+                <aside
+                  aria-label={`Settings for ${selected.label}`}
+                  className="fixed inset-x-0 bottom-0 z-30 max-h-[85dvh] overflow-y-auto rounded-t-3xl bg-bg p-4 pb-8 shadow-2xl lg:sticky lg:top-20 lg:z-auto lg:max-h-[calc(100dvh-6rem)] lg:self-start lg:rounded-2xl lg:border lg:border-line lg:bg-surface lg:pb-4 lg:shadow-none"
+                >
+                  <div className="mx-auto mb-3 h-1.5 w-10 rounded-full bg-line lg:hidden" />
+                  <SettingsPanel
+                    key={selected.id}
+                    field={selected}
+                    onChange={setField}
+                    onConvert={(t) => convert(selected, t)}
+                    onDelete={() => remove(selected)}
+                    onClose={() => setSelectedId(null)}
+                    allFields={schema.fields}
+                    labelOf={labelOf}
+                    sampleOf={sampleOf}
+                    liveValue={selected.formula && !fieldProblems[selected.id] ? sampleOf(selected.id) : null}
+                    problem={fieldProblems[selected.id]}
+                    steps={stepsFor(selected)}
+                    advanced={!!advanced[selected.id]}
+                    onSteps={(s) => onSteps(selected.id, s)}
+                    onAdvanced={(on) => setAdvanced((a) => ({ ...a, [selected.id]: on }))}
+                    tokens={drafts[selected.id] ?? []}
+                    onTokens={(t) => onTokens(selected.id, t)}
+                  />
+                </aside>
+              </>
+            ) : (
+              <aside className="hidden lg:block">
+                <div className="sticky top-20 flex flex-col gap-3 rounded-2xl border border-dashed border-line p-5 text-sm text-muted">
+                  <span className="font-semibold text-text">How to edit</span>
+                  <span>
+                    <b className="font-medium text-text">Click</b> any box or result on the calculator to change it.
+                  </span>
+                  <span>
+                    <b className="font-medium text-text">Drag ⠿</b> to change the order.
+                  </span>
+                  <span>
+                    <b className="font-medium text-text">Click a name</b> to rename it right there.
+                  </span>
+                  <span>
+                    <b className="font-medium text-text">★</b> makes a result big. <b className="font-medium text-text">👁</b> hides it from customers.
+                  </span>
+                  <span>
+                    <b className="font-medium text-text">Undo</b> (↶) takes back any change.
+                  </span>
+                </div>
+              </aside>
+            )}
           </div>
-        </div>
-      </div>
+        </BuilderDnd>
+      )}
+
+      {mode === "edit" && !selected && (
+        <button
+          type="button"
+          onClick={() => setAddOpen(true)}
+          className="fixed right-4 bottom-6 z-20 flex h-14 items-center gap-2 rounded-full bg-accent px-5 font-semibold text-accent-fg shadow-xl lg:hidden"
+        >
+          <IconPlus /> Add
+        </button>
+      )}
+      {addOpen && <AddSheet onAdd={(t) => addBlock(t)} onClose={() => setAddOpen(false)} />}
+
+      {shareOpen && (
+        <ShareSheet
+          meta={meta}
+          onMeta={setMeta}
+          onSlugTouched={() => setSlugTouched(true)}
+          saved={!isNew && savedDoc?.meta.slug === meta.slug}
+          onClose={() => setShareOpen(false)}
+          onExcel={onExcel}
+          uploadError={uploadError}
+          pending={pending}
+          onApply={applyPending}
+          onCancelPending={() => setPending(null)}
+        />
+      )}
+
+      {toast && (
+        <Toast
+          message={toast.message}
+          action={toast.undo ? "Undo" : undefined}
+          onAction={() => {
+            doUndo();
+            setToast(null);
+          }}
+          onClose={() => setToast(null)}
+        />
+      )}
     </div>
-  );
-}
-
-function DiffList({ diff }: { diff: ReuploadDiff }) {
-  const none = !diff.added.length && !diff.removed.length && !diff.changed.length;
-  if (none) return <p className="text-sm text-muted">No changes found. The sheet matches this calculator.</p>;
-  return (
-    <ul className="flex flex-col gap-1 text-sm">
-      {diff.added.map((l) => (
-        <li key={`a-${l}`} className="text-ok">
-          + New: {l}
-        </li>
-      ))}
-      {diff.changed.map((c) => (
-        <li key={`c-${c.label}`} className="text-warn">
-          ~ {c.label}: {c.what}
-        </li>
-      ))}
-      {diff.removed.map((l) => (
-        <li key={`r-${l}`} className="text-danger">
-          − Removed: {l}
-        </li>
-      ))}
-    </ul>
   );
 }

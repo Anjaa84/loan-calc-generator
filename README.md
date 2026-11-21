@@ -63,6 +63,6 @@ src/lib/engine/      tokenizer, parser (Excel precedence), evaluator, formatting
 src/lib/excel/       readWorkbook → extract (classify/label/hoist/verify) → mergeReupload
 src/lib/schema/      calculator JSON types + zod validation
 src/lib/templates/   HP loan template (15% min down payment, 6% service charge)
-src/components/      Calculator (public + preview), builder (fields, formula chips)
+src/components/      Calculator (public page), visual builder (drag-and-drop canvas, step formulas, settings panel)
 src/app/             / (list), /c/[slug] (public), /admin/* (login, list, new, edit)
 ```

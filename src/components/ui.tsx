@@ -88,6 +88,58 @@ export function Badge({ tone = "neutral", children }: { tone?: Tone; children: R
   );
 }
 
+/** A row of big tappable choices (instead of a <select>). */
+export function Segmented<T extends string | number>({
+  value,
+  options,
+  onChange,
+  label,
+}: {
+  value: T;
+  options: { value: T; label: ReactNode }[];
+  onChange: (v: T) => void;
+  label: string;
+}) {
+  return (
+    <div role="radiogroup" aria-label={label} className="flex flex-wrap gap-1.5">
+      {options.map((o) => (
+        <button
+          key={String(o.value)}
+          type="button"
+          role="radio"
+          aria-checked={o.value === value}
+          onClick={() => onChange(o.value)}
+          className={cx(
+            "h-10 rounded-lg border px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-accent",
+            o.value === value ? "border-accent bg-accent-soft text-accent" : "border-line bg-surface text-text hover:bg-surface-2",
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function Toast({ message, action, onAction, onClose }: { message: ReactNode; action?: string; onAction?: () => void; onClose: () => void }) {
+  return (
+    <div
+      role="status"
+      className="fixed inset-x-4 bottom-24 z-50 mx-auto flex max-w-md items-center gap-3 rounded-xl bg-text px-4 py-3 text-sm text-bg shadow-lg lg:bottom-6"
+    >
+      <span className="min-w-0 flex-1">{message}</span>
+      {action && (
+        <button type="button" onClick={onAction} className="font-semibold underline-offset-2 hover:underline">
+          {action}
+        </button>
+      )}
+      <button type="button" onClick={onClose} aria-label="Dismiss" className="opacity-70 hover:opacity-100">
+        ✕
+      </button>
+    </div>
+  );
+}
+
 export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode }) {
   return (
     <button

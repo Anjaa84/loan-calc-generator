@@ -1,44 +1,41 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { defaultInputs, evaluateSchema, type Values } from "@/lib/engine/evaluate";
-import { formatValue, parseUserNumber } from "@/lib/engine/format";
-import type { CalcSchema, Field } from "@/lib/schema/types";
+import { defaultInputs, evaluateSchema } from "@/lib/engine/evaluate";
+import { formatValue } from "@/lib/engine/format";
+import type { CalcSchema } from "@/lib/schema/types";
 import { cx } from "../ui";
+import { BigResult, InputRow, NumberBox, ResultRow, SelectBox, selectRaw, toRaw, valuesFromRaw } from "./parts";
 
 type Props = {
   schema: CalcSchema;
   currency?: string;
   /** Smaller paddings for the builder preview. */
   compact?: boolean;
+  /** Optional controlled values (the builder shares them between Edit and Try it). */
+  raw?: Record<string, string>;
+  onRawChange?: (raw: Record<string, string>) => void;
 };
 
-const toRaw = (f: Field, v: number | null | undefined) =>
-  v === null || v === undefined ? "" : f.format === "percent" ? String(+(v * 100).toFixed(10)) : String(v);
-
-function initialRaw(schema: CalcSchema): Record<string, string> {
+export function initialRaw(schema: CalcSchema): Record<string, string> {
   const d = defaultInputs(schema);
   const out: Record<string, string> = {};
   for (const f of schema.fields) if (f.kind === "input") out[f.id] = toRaw(f, d[f.id]);
   return out;
 }
 
-export function Calculator({ schema, currency = "", compact }: Props) {
-  const [raw, setRaw] = useState<Record<string, string>>(() => initialRaw(schema));
-  const inputs = schema.fields.filter((f) => f.kind === "input");
+export function Calculator({ schema, currency = "", compact, raw: rawProp, onRawChange }: Props) {
+  const [ownRaw, setOwnRaw] = useState<Record<string, string>>(() => initialRaw(schema));
+  const raw = rawProp ?? ownRaw;
+  const setRaw = (next: Record<string, string>) => (onRawChange ? onRawChange(next) : setOwnRaw(next));
 
-  const result = useMemo(() => {
-    const vals: Values = {};
-    for (const f of schema.fields) {
-      if (f.kind !== "input") continue;
-      const n = parseUserNumber(raw[f.id] ?? "");
-      vals[f.id] = n === null ? null : f.format === "percent" ? n / 100 : n;
-    }
-    return evaluateSchema(schema, vals, (v, f) => formatValue(v, f, currency));
-  }, [schema, raw, currency]);
+  const result = useMemo(
+    () => evaluateSchema(schema, valuesFromRaw(schema, raw), (v, f) => formatValue(v, f, currency)),
+    [schema, raw, currency],
+  );
 
   const byId = new Map(schema.fields.map((f) => [f.id, f]));
-  const visibleInputs = inputs.filter((f) => !f.hidden);
+  const visibleInputs = schema.fields.filter((f) => f.kind === "input" && !f.hidden);
   const outputs = schema.fields.filter((f) => f.kind !== "input" && !f.hidden);
   const highlighted = outputs.filter((f) => f.highlight);
   const rest = outputs.filter((f) => !f.highlight);
@@ -55,60 +52,23 @@ export function Calculator({ schema, currency = "", compact }: Props) {
               const minField = f.min?.field ? byId.get(f.min.field) : undefined;
               const minVal = minField ? result.values[minField.id] : null;
               const id = `in-${f.id}`;
+              const hint =
+                f.helpText || (minField && minVal != null) ? (
+                  <>
+                    {f.helpText}
+                    {f.helpText && minField && minVal != null ? " · " : ""}
+                    {minField && minVal != null && <>Minimum: {formatValue(minVal, minField, currency)}</>}
+                  </>
+                ) : undefined;
+              const set = (v: string) => setRaw({ ...raw, [f.id]: v });
               return (
-                <div key={f.id} className="flex flex-col gap-1.5">
-                  <label htmlFor={id} className="text-sm font-medium">
-                    {f.label}
-                  </label>
+                <InputRow key={f.id} id={id} label={f.label} error={err} hint={hint}>
                   {f.inputType === "select" ? (
-                    <select
-                      id={id}
-                      value={raw[f.id] ?? ""}
-                      onChange={(e) => setRaw((r) => ({ ...r, [f.id]: e.target.value }))}
-                      className="h-12 w-full rounded-xl border border-line bg-surface px-3 text-text focus:border-accent focus:outline-2 focus:outline-accent/30"
-                    >
-                      {(f.options ?? []).map((o) => (
-                        <option key={`${o.value}-${o.label}`} value={toRaw(f, o.value)}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
+                    <SelectBox id={id} field={f} value={selectRaw(f, raw[f.id])} onChange={set} />
                   ) : (
-                    <div
-                      className={cx(
-                        "flex h-12 items-center rounded-xl border bg-surface focus-within:outline-2",
-                        err ? "border-danger focus-within:outline-danger/30" : "border-line focus-within:border-accent focus-within:outline-accent/30",
-                      )}
-                    >
-                      {f.format === "currency" && currency && <span className="pl-3 text-muted">{currency}</span>}
-                      <input
-                        id={id}
-                        inputMode="decimal"
-                        autoComplete="off"
-                        placeholder="0"
-                        value={raw[f.id] ?? ""}
-                        aria-invalid={!!err}
-                        aria-describedby={err ? `${id}-err` : undefined}
-                        onChange={(e) => setRaw((r) => ({ ...r, [f.id]: e.target.value }))}
-                        className="tabular h-full w-full min-w-0 bg-transparent px-3 text-[17px] outline-none"
-                      />
-                      {f.format === "percent" && <span className="pr-3 text-muted">%</span>}
-                    </div>
+                    <NumberBox id={id} field={f} value={raw[f.id] ?? toRaw(f, f.defaultValue)} onChange={set} currency={currency} error={!!err} />
                   )}
-                  {err ? (
-                    <p id={`${id}-err`} className="text-sm text-danger" role="alert">
-                      {err}
-                    </p>
-                  ) : (
-                    (f.helpText || (minField && minVal !== null && minVal !== undefined)) && (
-                      <p className="text-xs text-muted">
-                        {f.helpText}
-                        {f.helpText && minField && minVal != null ? " · " : ""}
-                        {minField && minVal != null && <>Minimum: {formatValue(minVal, minField, currency)}</>}
-                      </p>
-                    )
-                  )}
-                </div>
+                </InputRow>
               );
             })}
           </div>
@@ -124,20 +84,12 @@ export function Calculator({ schema, currency = "", compact }: Props) {
       ) : (
         <section className="flex flex-col gap-3" aria-label="Results" aria-live="polite">
           {highlighted.map((f) => (
-            <div key={f.id} className={cx("rounded-2xl bg-accent text-accent-fg", pad)}>
-              <div className="text-sm opacity-90">{f.label}</div>
-              <div className="tabular mt-1 text-3xl font-semibold tracking-tight break-words sm:text-4xl">
-                {formatValue(result.values[f.id], f, currency)}
-              </div>
-            </div>
+            <BigResult key={f.id} label={f.label} value={formatValue(result.values[f.id], f, currency)} compact={compact} />
           ))}
           {rest.length > 0 && (
             <dl className={cx("rounded-2xl border border-line bg-surface", compact ? "px-4" : "px-5 sm:px-6")}>
               {rest.map((f) => (
-                <div key={f.id} className="flex items-baseline justify-between gap-4 border-b border-line py-3 last:border-b-0">
-                  <dt className="text-sm text-muted">{f.label}</dt>
-                  <dd className="tabular shrink-0 text-right font-medium whitespace-nowrap">{formatValue(result.values[f.id], f, currency)}</dd>
-                </div>
+                <ResultRow key={f.id} label={f.label} value={formatValue(result.values[f.id], f, currency)} className="border-b border-line last:border-b-0" />
               ))}
             </dl>
           )}

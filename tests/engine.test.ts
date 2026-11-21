@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateSchema, evalExpr } from "@/lib/engine/evaluate";
+import { defaultInputs, evaluateSchema, evalExpr } from "@/lib/engine/evaluate";
 import { exprToTokens, parseExcelFormula, parseTokens } from "@/lib/engine/parse";
 import { exprToText, formatValue } from "@/lib/engine/format";
 import { validateSchema } from "@/lib/schema/validate";
@@ -74,6 +74,34 @@ describe("HP loan template (owner's formulas)", () => {
     const labels = new Map(schema.fields.map((f) => [f.id, f.label]));
     const sc = schema.fields.find((f) => f.id === "service_charge")!;
     expect(exprToText(sc.formula!, (id) => labels.get(id)!)).toBe("Loan Amount × 6%");
+  });
+});
+
+describe("dropdown defaults", () => {
+  it("ignores a stale default that matches none of the options", () => {
+    const schema = hpLoanTemplate();
+    const hp = schema.fields.find((f) => f.id === "hp_price")!;
+    // Percent dropdown whose default is left over from the old "3 months" options.
+    schema.fields.push({
+      id: "pct",
+      label: "Down Payment %",
+      kind: "input",
+      inputType: "select",
+      format: "percent",
+      decimals: 0,
+      defaultValue: 3,
+      options: [0.1, 0.15, 0.2].map((v) => ({ label: `${v * 100}%`, value: v })),
+    });
+    schema.fields.find((f) => f.id === "min_down_payment")!.formula = {
+      t: "bin",
+      op: "*",
+      l: { t: "ref", field: hp.id },
+      r: { t: "ref", field: "pct" },
+    };
+    const inputs = defaultInputs(schema);
+    expect(inputs.pct).toBe(0.1);
+    const { values } = evaluateSchema(schema, { ...inputs, hp_price: 10000 });
+    expect(values.min_down_payment).toBeCloseTo(1000);
   });
 });
 

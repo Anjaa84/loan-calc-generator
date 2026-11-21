@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { selectDefault } from "@/lib/engine/evaluate";
 import { exprToText, formatValue } from "@/lib/engine/format";
 import type { Token } from "@/lib/engine/tokens";
 import type { Bound, Field, FieldFormat, FieldKind, SelectOption } from "@/lib/schema/types";
@@ -265,7 +266,7 @@ function OptionsEditor({ field: f, onChange }: { field: Field; onChange: (f: Fie
         <FormField label="Selected by default" htmlFor={`seldef-${f.id}`}>
           <Select
             id={`seldef-${f.id}`}
-            value={String(f.defaultValue ?? opts[0].value)}
+            value={String(selectDefault(f))}
             onChange={(e) => onChange({ ...f, defaultValue: Number(e.target.value) })}
           >
             {opts.map((o, i) => (

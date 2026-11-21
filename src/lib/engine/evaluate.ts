@@ -185,12 +185,20 @@ export function evaluateSchema(
   return { values, errors, cycle };
 }
 
+/** A dropdown's default, ignoring a stale default that matches none of its options. */
+export function selectDefault(f: Field): number | null {
+  const opts = f.options ?? [];
+  const d = f.defaultValue;
+  if (d != null && opts.some((o) => Math.abs(o.value - d) < 1e-9)) return d;
+  return opts[0]?.value ?? null;
+}
+
 /** Default input values for a schema (select → first option). */
 export function defaultInputs(schema: CalcSchema): Values {
   const out: Values = {};
   for (const f of schema.fields) {
     if (f.kind !== "input") continue;
-    if (f.inputType === "select") out[f.id] = f.defaultValue ?? f.options?.[0]?.value ?? null;
+    if (f.inputType === "select") out[f.id] = selectDefault(f);
     else out[f.id] = f.defaultValue ?? null;
   }
   return out;
